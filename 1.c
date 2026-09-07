@@ -5,7 +5,7 @@
 #include <curl/curl.h>
 
 #define MAX_ATTR_LEN 2048
-#define MIN_TEXT_LEN 25 // حداقل طول متن برای چاپ شدن
+#define MIN_TEXT_LEN 25
 
 typedef enum {
     STATE_OUTSIDE,
@@ -18,12 +18,20 @@ typedef enum {
     STATE_SKIP_TAG
 } ParserState;
 
-static char current_domain[256] = "";
-static char text_buf[16384];
-static int text_idx = 0;
-static char active_tag_type[8] = ""; // برای تشخیص p, h1, h2, h3, li
+typedef struct {
+    ParserState state;
+    char current_domain[256];
+    char text_buf[16384];
+    int text_idx;
+    char active_tag_type[8];
+    char tag_name[32];
+    int tag_name_len;
+    char attr_buffer[MAX_ATTR_LEN];
+    int attr_len;
+    int inside_block;
+    int skip_depth;
+} ParserContext;
 
-// فیلتر هوشمند تصاویر بی‌ارزش، آیکون‌ها و فایل‌های SVG
 int is_valid_media_url(const char *url) {
     if (strstr(url, ".svg") != NULL) return 0;
     if (strstr(url, "/math/render/") != NULL) return 0;
@@ -36,7 +44,7 @@ int is_valid_media_url(const char *url) {
     return 1;
 }
 
-void extract_and_print_src(const char *tag_buf, const char *tag_type) {
+void extract_and_print_src(const char *tag_buf, const char *tag_type, const char *domain) {
     const char *src_ptr = strstr(tag_buf, "src=\"");
     if (!src_ptr) src_ptr = strstr(tag_buf, "src='");
 
@@ -54,7 +62,7 @@ void extract_and_print_src(const char *tag_buf, const char *tag_type) {
             if (strncmp(url, "//", 2) == 0) {
                 printf("\n  ↳ [%s]: https:%s", tag_type, url);
             } else if (url[0] == '/') {
-                printf("\n  ↳ [%s]: %s%s", tag_type, current_domain, url);
+                printf("\n  ↳ [%s]: %s%s", tag_type, domain, url);
             } else {
                 printf("\n  ↳ [%s]: %s", tag_type, url);
             }
@@ -62,143 +70,135 @@ void extract_and_print_src(const char *tag_buf, const char *tag_type) {
     }
 }
 
-void flush_text_buffer() {
-    if (text_idx >= MIN_TEXT_LEN || (strcmp(active_tag_type, "h1") == 0 || strcmp(active_tag_type, "h2") == 0 || strcmp(active_tag_type, "h3") == 0)) {
-        text_buf[text_idx] = '\0';
+void flush_text_buffer(ParserContext *ctx) {
+    if (ctx->text_idx >= MIN_TEXT_LEN || (strcmp(ctx->active_tag_type, "h1") == 0 || 
+        strcmp(ctx->active_tag_type, "h2") == 0 || strcmp(ctx->active_tag_type, "h3") == 0)) {
         
+        ctx->text_buf[ctx->text_idx] = '\0';
+
         printf("\n\n--------------------------------------------------\n");
-        if (strcmp(active_tag_type, "h1") == 0) printf("# ");
-        else if (strcmp(active_tag_type, "h2") == 0) printf("## ");
-        else if (strcmp(active_tag_type, "h3") == 0) printf("### ");
-        else if (strcmp(active_tag_type, "li") == 0) printf("* ");
+        if (strcmp(ctx->active_tag_type, "h1") == 0) printf("# ");
+        else if (strcmp(ctx->active_tag_type, "h2") == 0) printf("## ");
+        else if (strcmp(ctx->active_tag_type, "h3") == 0) printf("### ");
+        else if (strcmp(ctx->active_tag_type, "li") == 0) printf("* ");
         else printf("[TEXT]: ");
 
-        printf("%s", text_buf);
+        printf("%s", ctx->text_buf);
     }
-    text_idx = 0;
-    active_tag_type[0] = '\0';
+    ctx->text_idx = 0;
+    ctx->active_tag_type[0] = '\0';
 }
 
-void parse_and_extract(const char *buffer, size_t length) {
-    static ParserState state = STATE_OUTSIDE;
-    static char tag_name[32];
-    static int tag_name_len = 0;
-    static char attr_buffer[MAX_ATTR_LEN];
-    static int attr_len = 0;
-    static int inside_block = 0;
-    static int skip_depth = 0;
-
+void parse_and_extract(const char *buffer, size_t length, ParserContext *ctx) {
     for (size_t i = 0; i < length; i++) {
         char c = buffer[i];
 
-        if (state == STATE_SKIP_TAG) {
+        if (ctx->state == STATE_SKIP_TAG) {
             if (c == '>') {
-                if (skip_depth > 0) skip_depth--;
-                if (skip_depth == 0) state = inside_block ? STATE_IN_TEXT : STATE_OUTSIDE;
+                if (ctx->skip_depth > 0) ctx->skip_depth--;
+                if (ctx->skip_depth == 0) ctx->state = ctx->inside_block ? STATE_IN_TEXT : STATE_OUTSIDE;
             }
             continue;
         }
 
-        switch (state) {
+        switch (ctx->state) {
             case STATE_OUTSIDE:
                 if (c == '<') {
-                    state = STATE_MATCH_TAG;
-                    tag_name_len = 0;
+                    ctx->state = STATE_MATCH_TAG;
+                    ctx->tag_name_len = 0;
                 }
                 break;
 
             case STATE_IN_TEXT:
                 if (c == '<') {
-                    state = STATE_MATCH_TAG;
-                    tag_name_len = 0;
+                    ctx->state = STATE_MATCH_TAG;
+                    ctx->tag_name_len = 0;
                 } else {
                     if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-                    
-                    // جلوگیری از فاصله‌های متوالی
-                    if (c == ' ' && text_idx > 0 && text_buf[text_idx - 1] == ' ') {
+
+                    if (c == ' ' && ctx->text_idx > 0 && ctx->text_buf[ctx->text_idx - 1] == ' ') {
                         break;
                     }
 
-                    if (text_idx < (int)sizeof(text_buf) - 1) {
-                        text_buf[text_idx++] = c;
+                    if (ctx->text_idx < (int)sizeof(ctx->text_buf) - 1) {
+                        ctx->text_buf[ctx->text_idx++] = c;
                     }
                 }
                 break;
 
             case STATE_IN_INNER_TAG:
                 if (c == '>') {
-                    state = STATE_IN_TEXT;
-                    // رفع چسبیدن کلمات: اضافه کردن فاصله هوشمند پس از خروج از تگ‌های درون متنی مثل <a>
-                    if (text_idx > 0 && text_buf[text_idx - 1] != ' ') {
-                        text_buf[text_idx++] = ' ';
+                    ctx->state = STATE_IN_TEXT;
+                    if (ctx->text_idx > 0 && ctx->text_buf[ctx->text_idx - 1] != ' ') {
+                        ctx->text_buf[ctx->text_idx++] = ' ';
                     }
                 }
                 break;
 
             case STATE_MATCH_TAG:
                 if (isalpha((unsigned char)c) || c == '/' || isdigit((unsigned char)c)) {
-                    if (tag_name_len < (int)sizeof(tag_name) - 1) {
-                        tag_name[tag_name_len++] = tolower((unsigned char)c);
+                    if (ctx->tag_name_len < (int)sizeof(ctx->tag_name) - 1) {
+                        ctx->tag_name[ctx->tag_name_len++] = tolower((unsigned char)c);
                     }
                 } else {
-                    tag_name[tag_name_len] = '\0';
+                    ctx->tag_name[ctx->tag_name_len] = '\0';
 
-                    if (strcmp(tag_name, "p") == 0 || strcmp(tag_name, "h1") == 0 || 
-                        strcmp(tag_name, "h2") == 0 || strcmp(tag_name, "h3") == 0 || 
-                        strcmp(tag_name, "li") == 0) {
-                        
-                        if (inside_block) flush_text_buffer();
-                        inside_block = 1;
-                        text_idx = 0;
-                        strncpy(active_tag_type, tag_name, sizeof(active_tag_type) - 1);
-                        state = STATE_WAIT_TAG_CLOSE;
-                    } 
-                    else if (strcmp(tag_name, "/p") == 0 || strcmp(tag_name, "/h1") == 0 || 
-                             strcmp(tag_name, "/h2") == 0 || strcmp(tag_name, "/h3") == 0 || 
-                             strcmp(tag_name, "/li") == 0) {
-                        
-                        inside_block = 0;
-                        flush_text_buffer();
-                        state = STATE_OUTSIDE;
-                    } 
-                    else if (strcmp(tag_name, "img") == 0) {
-                        attr_len = 0;
-                        state = STATE_IN_IMG;
-                    } 
-                    else if (strcmp(tag_name, "video") == 0) {
-                        attr_len = 0;
-                        state = STATE_IN_VIDEO;
-                    } 
-                    else if (strcmp(tag_name, "script") == 0 || strcmp(tag_name, "style") == 0 || 
-                             strcmp(tag_name, "sup") == 0 || strcmp(tag_name, "table") == 0) {
-                        skip_depth = 1;
-                        state = STATE_SKIP_TAG;
-                    } 
+                    if (strcmp(ctx->tag_name, "p") == 0 || strcmp(ctx->tag_name, "h1") == 0 ||
+                        strcmp(ctx->tag_name, "h2") == 0 || strcmp(ctx->tag_name, "h3") == 0 ||
+                        strcmp(ctx->tag_name, "li") == 0) {
+
+                        if (ctx->inside_block) flush_text_buffer(ctx);
+                        ctx->inside_block = 1;
+                        ctx->text_idx = 0;
+                        strncpy(ctx->active_tag_type, ctx->tag_name, sizeof(ctx->active_tag_type) - 1);
+                        ctx->state = STATE_WAIT_TAG_CLOSE;
+                    }
+                    else if (strcmp(ctx->tag_name, "/p") == 0 || strcmp(ctx->tag_name, "/h1") == 0 ||
+                             strcmp(ctx->tag_name, "/h2") == 0 || strcmp(ctx->tag_name, "/h3") == 0 ||
+                             strcmp(ctx->tag_name, "/li") == 0) {
+
+                        ctx->inside_block = 0;
+                        flush_text_buffer(ctx);
+                        ctx->state = STATE_OUTSIDE;
+                    }
+                    else if (strcmp(ctx->tag_name, "img") == 0) {
+                        ctx->attr_len = 0;
+                        ctx->state = STATE_IN_IMG;
+                    }
+                    else if (strcmp(ctx->tag_name, "video") == 0) {
+                        ctx->attr_len = 0;
+                        ctx->state = STATE_IN_VIDEO;
+                    }
+                    else if (strcmp(ctx->tag_name, "script") == 0 || strcmp(ctx->tag_name, "style") == 0 ||
+                             strcmp(ctx->tag_name, "sup") == 0 || strcmp(ctx->tag_name, "table") == 0) {
+                        ctx->skip_depth = 1;
+                        ctx->state = STATE_SKIP_TAG;
+                    }
                     else {
-                        state = inside_block ? STATE_IN_INNER_TAG : STATE_OUTSIDE;
+                        ctx->state = ctx->inside_block ? STATE_IN_INNER_TAG : STATE_OUTSIDE;
                     }
                 }
                 break;
 
             case STATE_WAIT_TAG_CLOSE:
                 if (c == '>') {
-                    state = STATE_IN_TEXT;
+                    ctx->state = STATE_IN_TEXT;
                 }
                 break;
 
             case STATE_IN_IMG:
             case STATE_IN_VIDEO:
                 if (c == '>') {
-                    attr_buffer[attr_len] = '\0';
-                    if (state == STATE_IN_IMG) {
-                        extract_and_print_src(attr_buffer, "IMAGE");
+                    ctx->attr_buffer[ctx->attr_len] = '\0';
+                    if (ctx->state == STATE_IN_IMG) {
+                        extract_and_print_src(ctx->attr_buffer, "IMAGE", ctx->current_domain);
                     } else {
-                        extract_and_print_src(attr_buffer, "VIDEO");
+                        extract_and_print_src(ctx->attr_buffer, "VIDEO", ctx->current_domain);
                     }
-                    state = inside_block ? STATE_IN_TEXT : STATE_OUTSIDE;
+                    ctx->state = ctx->inside_block ? STATE_IN_TEXT : STATE_OUTSIDE;
                 } else {
-                    if (attr_len < MAX_ATTR_LEN - 1) {
-                        attr_buffer[attr_len++] = c;
+                    if (ctx->attr_len < MAX_ATTR_LEN - 1) {
+                        ctx->attr_buffer[ctx->attr_len++] = c;
                     }
                 }
                 break;
@@ -211,12 +211,20 @@ void parse_and_extract(const char *buffer, size_t length) {
 
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
-    parse_and_extract((char *)contents, realsize);
+    ParserContext *ctx = (ParserContext *)userp;
+    parse_and_extract((char *)contents, realsize, ctx);
     return realsize;
 }
 
 int main(int argc, char *argv[]) {
+    int exit_code = 0;
+    CURL *curl_handle = NULL;
+    CURLcode res;
     char url[512];
+
+    ParserContext ctx;
+    memset(&ctx, 0, sizeof(ParserContext));
+    ctx.state = STATE_OUTSIDE;
 
     if (argc >= 2) {
         strncpy(url, argv[1], sizeof(url) - 1);
@@ -226,7 +234,10 @@ int main(int argc, char *argv[]) {
         printf("         SEEKER - Web Extractor          \n");
         printf("=========================================\n");
         printf("Enter URL: ");
-        if (scanf("%511s", url) != 1) return 1;
+        if (scanf("%511s", url) != 1) {
+            exit_code = 1;
+            goto cleanup;
+        }
     }
 
     char full_url[600];
@@ -236,23 +247,26 @@ int main(int argc, char *argv[]) {
         strncpy(full_url, url, sizeof(full_url) - 1);
     }
 
-    sscanf(full_url, "%*[^:]://%255[^/]", current_domain);
-    char temp_domain[300];
-    snprintf(temp_domain, sizeof(temp_domain), "https://%s", current_domain);
-    strcpy(current_domain, temp_domain);
-
-    CURL *curl_handle;
-    CURLcode res;
+    char temp_domain[256] = "";
+    if (sscanf(full_url, "%*[^:]://%255[^/]", temp_domain) == 1) {
+        snprintf(ctx.current_domain, sizeof(ctx.current_domain), "https://%s", temp_domain);
+    } else {
+        snprintf(ctx.current_domain, sizeof(ctx.current_domain), "https://localhost");
+    }
 
     curl_global_init(CURL_GLOBAL_ALL);
     curl_handle = curl_easy_init();
 
-    if (!curl_handle) return 1;
+    if (!curl_handle) {
+        exit_code = 1;
+        goto cleanup;
+    }
 
     printf("\n[+] Connecting to: %s ...\n", full_url);
 
     curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&ctx);
     curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
     curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -261,15 +275,16 @@ int main(int argc, char *argv[]) {
 
     if (res != CURLE_OK) {
         fprintf(stderr, "\n[-] Fetch failed: %s\n", curl_easy_strerror(res));
+        exit_code = 1;
     } else {
         printf("\n\n=========================================\n");
         printf("[+] Extraction Complete!\n");
         printf("=========================================\n");
     }
 
-    curl_cleanup:
-    curl_easy_cleanup(curl_handle);
+cleanup:
+    if (curl_handle) curl_easy_cleanup(curl_handle);
     curl_global_cleanup();
 
-    return 0;
+    return exit_code;
 }
